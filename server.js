@@ -1,0 +1,129 @@
+require('dotenv').config();
+const express = require('express');
+const path = require('path');
+const cookieParser = require('cookie-parser');
+const jwt = require('jsonwebtoken');
+const bcrypt = require('bcryptjs');
+const Docker = require('dockerode');
+const http = require('http');
+const { Server } = require('socket.io');
+const sqlite3 = require('sqlite3').verbose();
+
+const app = express();
+const server = http.createServer(app);
+const io = new Server(server);
+const docker = new Docker();
+
+app.set('view engine', 'ejs');
+app.set('views', path.join(__dirname, 'views'));
+app.use(express.static(path.join(__dirname, 'public')));
+app.use(express.json());
+app.use(express.urlencoded({ extended: true }));
+app.use(cookieParser());
+
+const db = new sqlite3.Database('./eclipser.db');
+db.serialize(() => {
+  db.run(`CREATE TABLE IF NOT EXISTS users (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    username TEXT UNIQUE NOT NULL,
+    password TEXT NOT NULL,
+    role TEXT DEFAULT 'user'
+  )`);
+  // Default admin
+  db.get("SELECT * FROM users WHERE username = 'admin'", (err, row) => {
+    if (!row) {
+      const hash = bcrypt.hashSync('changeMe123!', 10);
+      db.run("INSERT INTO users (username, password, role) VALUES (?, ?, ?)", ['admin', hash, 'admin']);
+    }
+  });
+});
+
+// Auth middleware
+const authenticate = (req, res, next) => {
+  const token = req.cookies.token;
+  if (!token) return res.redirect('/login');
+  jwt.verify(token, process.env.JWT_SECRET, (err, decoded) => {
+    if (err) return res.redirect('/login');
+    req.user = decoded;
+    next();
+  });
+};
+
+// Routes
+app.get('/', (req, res) => res.redirect('/login'));
+
+app.get('/login', (req, res) => res.render('login', { error: null }));
+
+app.post('/login', (req, res) => {
+  const { username, password } = req.body;
+  db.get("SELECT * FROM users WHERE username = ?", [username], (err, user) => {
+    if (err || !user || !bcrypt.compareSync(password, user.password)) {
+      return res.render('login', { error: 'Invalid credentials' });
+    }
+    const token = jwt.sign({ id: user.id, username: user.username, role: user.role }, process.env.JWT_SECRET, { expiresIn: '24h' });
+    res.cookie('token', token, { httpOnly: true });
+    res.redirect('/dashboard');
+  });
+});
+
+app.get('/register', (req, res) => res.render('register', { error: null }));
+
+app.post('/register', (req, res) => {
+  const { username, password } = req.body;
+  if (!username || !password) return res.render('register', { error: 'Missing fields' });
+  const hash = bcrypt.hashSync(password, 10);
+  db.run("INSERT INTO users (username, password) VALUES (?, ?)", [username, hash], (err) => {
+    if (err) return res.render('register', { error: 'Username already taken' });
+    res.redirect('/login');
+  });
+});
+
+app.get('/dashboard', authenticate, async (req, res) => {
+  try {
+    const containers = await docker.listContainers({ all: true, filters: { label: ['com.eclipser.owner=' + req.user.id] } });
+    res.render('dashboard', { user: req.user, servers: containers });
+  } catch (err) {
+    res.render('dashboard', { user: req.user, servers: [], error: err.message });
+  }
+});
+
+app.post('/api/create-server', authenticate, async (req, res) => {
+  const { name = 'myserver', memory = '2048', port = '25565' } = req.body;
+  try {
+    const container = await docker.createContainer({
+      Image: 'itzg/minecraft-server:latest',
+      name: `eclipser-${req.user.id}-${name}`,
+      Labels: { 'com.eclipser.owner': req.user.id.toString() },
+      Env: [
+        'EULA=TRUE',
+        'TYPE=PAPER',
+        'MEMORY=' + memory + 'M',
+        'ENABLE_RCON=true',
+        'RCON_PASSWORD=secret'
+      ],
+      ExposedPorts: { '25565/tcp': {} },
+      HostConfig: {
+        PortBindings: { '25565/tcp': [{ HostPort: port }] },
+        Memory: parseInt(memory) * 1024 * 1024,
+      },
+      Tty: true,
+      OpenStdin: true
+    });
+    await container.start();
+    res.json({ success: true, message: 'Server created and started!' });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// Logout
+app.get('/logout', (req, res) => {
+  res.clearCookie('token');
+  res.redirect('/login');
+});
+
+// Start
+const PORT = process.env.PORT || 3000;
+server.listen(PORT, () => {
+  console.log(`Eclipser Panel running on http://localhost:${PORT}`);
+});
